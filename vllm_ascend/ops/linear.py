@@ -136,7 +136,7 @@ class AscendQKVParallelLinear(QKVParallelLinear):
         self.output_sizes = [
             self.num_heads * self.head_size * tp_size,  # q_proj
             self.num_kv_heads * self.head_size * tp_size,  # k_proj
-            self.num_kv_heads * self.head_size * tp_size,  # v_proj
+            self.num_kv_heads * self.v_head_size * tp_size,  # v_proj
         ]
         AscendColumnParallelLinear.__init__(self,
                                             input_size=input_size,

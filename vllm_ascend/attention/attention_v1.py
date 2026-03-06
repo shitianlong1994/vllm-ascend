@@ -370,6 +370,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.is_kv_producer = (
             self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.is_kv_producer
         )
+        self.sinks = kwargs.get("sinks",None)
+        if self.sinks is not None:
+            assert self.sinks.shape[0] == num_heads, (
+                "Sinks must have the same number of heads as the number of "
+                "heads in the layer"
+            )
+       
 
     @staticmethod
     def update_graph_params(
@@ -715,31 +722,31 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
     def _forward_fia_slidingwindow(self, query: torch.Tensor, attn_metadata: AscendMetadata, output: torch.Tensor):
         batch_size = attn_metadata.seq_lens.shape[0]
+        query = query.view(batch_size,  self.num_heads , self.head_size)
         block_size = 128
-        query = query.view(batch_size, 1, self.num_heads * self.head_size)
         key = self.key_cache
         value = self.value_cache
         if self.key_cache is not None and self.value_cache is not None:
             block_size = self.key_cache.shape[1]
             key = self.key_cache.flatten(2, 3).contiguous()
             value = self.value_cache.flatten(2, 3).contiguous()
-
-        output, _ = torch_npu.npu_fused_infer_attention_score(
+        attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
             query,
             key,
             value,
-            num_heads=self.num_heads,
+            num_query_heads=self.num_heads,
             num_key_value_heads=self.num_kv_heads,
-            input_layout="BSH",
+            input_layout="TND",
             block_size=block_size,
             pre_tokens=self.sliding_window,
-            scale=self.scale,
+            softmax_scale=self.scale,
             block_table=attn_metadata.block_tables,
-            actual_seq_lengths=[1] * len(attn_metadata.seq_lens),
-            actual_seq_lengths_kv=attn_metadata.seq_lens,
+            actual_seq_qlen=[1] * len(attn_metadata.seq_lens),
+            actual_seq_kvlen=attn_metadata.seq_lens,
+            learnable_sink=self.sinks
         )
-
-        output = output.view(batch_size, self.num_heads, self.head_size)
+        attn_output = attn_output.view(batch_size, self.num_heads, self.head_size)
+        output[:batch_size] = attn_output[:batch_size]
         return output
 
     def forward_fused_infer_attention(
@@ -774,20 +781,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
             key = key[:num_tokens]
             value = value[:num_tokens]
         # Get workspace from cache or calculate it if not present.
-        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+        attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
             query=query,
             key=key,
             value=value,
-            atten_mask=attn_metadata.attn_mask,
+            atten_mask=attn_metadata.swa_mask,
             block_table=block_table,
             input_layout="TND",
             block_size=block_size,
-            actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
-            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            actual_seq_qlen=attn_metadata.actual_seq_lengths_q,
+            actual_seq_kvlen=actual_seq_lengths_kv,
             num_key_value_heads=self.num_kv_heads,
-            num_heads=self.num_heads,
-            scale=self.scale,
+            num_query_heads=self.num_heads,
+            softmax_scale=self.scale,
             sparse_mode=3,
+            learnable_sink=self.sinks
         )
 
         attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
